@@ -17,6 +17,7 @@ package org.sakaiproject.datemanager.api;
 
 import java.io.Serializable;
 import java.io.InputStream;
+import java.time.Instant;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
@@ -50,6 +51,21 @@ public interface DateManagerService {
 	public boolean currentSiteContainsTool(String commonId);
 	public String getToolTitle(String commonId);
 	public List<String> getBulkDateFieldsForCurrentSite();
+
+	/**
+	 * Shift all of a site's dates according to a rollover mode, used at term-rollover / site-copy time.
+	 * {@code OFFSET} moves every date by {@code offsetDays}; {@code ANCHOR}/{@code ANCHOR_SNAP} re-anchor
+	 * the whole timeline between {@code newFirst} and {@code newLast} (snap keeps each item's weekday and
+	 * time). {@code NONE} (or a null mode) is a no-op. This never throws - any failure is logged so it
+	 * cannot break the caller (e.g. a site duplicate); items that fail validation are skipped and logged.
+	 *
+	 * @param siteId     the site whose dates to shift
+	 * @param mode       the shift mode
+	 * @param offsetDays days to add (OFFSET mode only; may be null otherwise)
+	 * @param newFirst   the new term's first date (anchor modes only; may be null otherwise)
+	 * @param newLast    the new term's last date (anchor modes only; may be null otherwise)
+	 */
+	public void shiftSiteDates(String siteId, RolloverMode mode, Integer offsetDays, Instant newFirst, Instant newLast);
 
 	// Assignments methods
 	public JSONArray getAssignmentsForContext(String siteId);

@@ -30,6 +30,7 @@ import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
 import java.time.format.DateTimeParseException;
 import java.time.temporal.ChronoField;
+import java.util.function.UnaryOperator;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -79,6 +80,7 @@ import org.sakaiproject.content.api.ContentEntity;
 import org.sakaiproject.content.api.ContentHostingService;
 import org.sakaiproject.content.api.ContentResourceEdit;
 import org.sakaiproject.datemanager.api.DateManagerConstants;
+import org.sakaiproject.datemanager.api.RolloverMode;
 import org.sakaiproject.datemanager.api.DateManagerService;
 import org.sakaiproject.datemanager.api.model.DateManagerError;
 import org.sakaiproject.datemanager.api.model.DateManagerUpdate;
@@ -1776,6 +1778,192 @@ public class DateManagerServiceImpl implements DateManagerService {
                         page.setReleaseDate(openDateTemp);
                         log.debug("Saving changes on lessons : {}", simplePageToolDao.quickUpdate(page));
                 }
+	}
+
+	// ----- Term-rollover date shift engine -----
+
+	// Date-bearing JSON keys any tool row may carry; the engine shifts whichever ones are present.
+	private static final String[] SHIFTABLE_DATE_KEYS = {
+		DateManagerConstants.JSON_OPENDATE_PARAM_NAME,
+		DateManagerConstants.JSON_DUEDATE_PARAM_NAME,
+		DateManagerConstants.JSON_ACCEPTUNTIL_PARAM_NAME,
+		DateManagerConstants.JSON_FEEDBACKSTART_PARAM_NAME,
+		DateManagerConstants.JSON_FEEDBACKEND_PARAM_NAME,
+		DateManagerConstants.JSON_SIGNUPBEGINS_PARAM_NAME,
+		DateManagerConstants.JSON_SIGNUPDEADLINE_PARAM_NAME
+	};
+
+	/**
+	 * Shift a whole site's dates for a term rollover (see {@link DateManagerService#shiftSiteDates}).
+	 * Reuses the per-tool get/validate/update pipeline; math is {@link DateShiftCalculator}.
+	 *
+	 * <p>NOTE (Phase 3 hook): several get*/validate* methods read the <em>current tool session</em>
+	 * site via getCurrentSiteId() (notably gradebook), so this is only correct when {@code siteId} is
+	 * also the current site. The site-copy hook must establish the target site's session context first.</p>
+	 */
+	@Override
+	public void shiftSiteDates(String siteId, RolloverMode mode, Integer offsetDays, Instant newFirst, Instant newLast) {
+		if (mode == null || mode == RolloverMode.NONE) {
+			return;
+		}
+		if (mode == RolloverMode.OFFSET && (offsetDays == null || offsetDays.intValue() == 0)) {
+			return;
+		}
+
+		try {
+			final ZoneId zone = userTimeService.getLocalTimeZone().toZoneId();
+			final boolean snap = (mode == RolloverMode.ANCHOR_SNAP);
+			final boolean anchor = (mode == RolloverMode.ANCHOR || snap);
+
+			// Read each present tool's dated rows once.
+			JSONArray assignments    = currentSiteContainsTool(DateManagerConstants.COMMON_ID_ASSIGNMENTS)   ? getAssignmentsForContext(siteId)    : new JSONArray();
+			JSONArray assessments    = currentSiteContainsTool(DateManagerConstants.COMMON_ID_ASSESSMENTS)   ? getAssessmentsForContext(siteId)    : new JSONArray();
+			JSONArray gradebookItems = currentSiteContainsTool(DateManagerConstants.COMMON_ID_GRADEBOOK)     ? getGradebookItemsForContext(siteId) : new JSONArray();
+			JSONArray signupMeetings = currentSiteContainsTool(DateManagerConstants.COMMON_ID_SIGNUP)        ? getSignupMeetingsForContext(siteId) : new JSONArray();
+			JSONArray resources      = currentSiteContainsTool(DateManagerConstants.COMMON_ID_RESOURCES)     ? getResourcesForContext(siteId)      : new JSONArray();
+			JSONArray calendarEvents = currentSiteContainsTool(DateManagerConstants.COMMON_ID_CALENDAR)      ? getCalendarEventsForContext(siteId) : new JSONArray();
+			JSONArray forums         = currentSiteContainsTool(DateManagerConstants.COMMON_ID_FORUMS)        ? getForumsForContext(siteId)         : new JSONArray();
+			JSONArray announcements  = currentSiteContainsTool(DateManagerConstants.COMMON_ID_ANNOUNCEMENTS) ? getAnnouncementsForContext(siteId)  : new JSONArray();
+			JSONArray lessons        = currentSiteContainsTool(DateManagerConstants.COMMON_ID_LESSONS)       ? getLessonsForContext(siteId)        : new JSONArray();
+
+			JSONArray[] allTools = { assignments, assessments, gradebookItems, signupMeetings, resources, calendarEvents, forums, announcements, lessons };
+
+			final UnaryOperator<ZonedDateTime> shift;
+			if (anchor) {
+				ZonedDateTime[] extent = computeDateExtent(allTools, zone);
+				if (extent == null) {
+					log.info("DateManager rollover: site {} has no dates to anchor; nothing to shift", siteId);
+					return;
+				}
+				if (newFirst == null || newLast == null || !newFirst.isBefore(newLast)) {
+					log.warn("DateManager rollover: site {} needs a valid new first/last date for anchor mode; skipping", siteId);
+					return;
+				}
+				final ZonedDateTime oldStart = extent[0];
+				final ZonedDateTime oldEnd = extent[1];
+				final ZonedDateTime nf = ZonedDateTime.ofInstant(newFirst, zone);
+				final ZonedDateTime nl = ZonedDateTime.ofInstant(newLast, zone);
+				shift = cur -> DateShiftCalculator.fit(cur, oldStart, oldEnd, nf, nl, snap);
+			} else {
+				final long days = offsetDays.longValue();
+				shift = cur -> DateShiftCalculator.shiftByDays(cur, days);
+			}
+
+			for (JSONArray arr : allTools) {
+				shiftRows(arr, zone, shift);
+			}
+
+			// Validate every tool, then apply all-or-nothing (mirrors the Date Manager save flow).
+			DateManagerValidation vAssignments = validateAssignments(siteId, assignments);
+			DateManagerValidation vAssessments = validateAssessments(siteId, assessments);
+			DateManagerValidation vGradebook   = validateGradebookItems(siteId, gradebookItems);
+			DateManagerValidation vSignup      = validateSignupMeetings(siteId, signupMeetings);
+			DateManagerValidation vResources   = validateResources(siteId, resources);
+			DateManagerValidation vCalendar    = validateCalendarEvents(siteId, calendarEvents);
+			DateManagerValidation vForums      = validateForums(siteId, forums);
+			DateManagerValidation vAnnounce    = validateAnnouncements(siteId, announcements);
+			DateManagerValidation vLessons     = validateLessons(siteId, lessons);
+
+			DateManagerValidation[] validations = { vAssignments, vAssessments, vGradebook, vSignup, vResources, vCalendar, vForums, vAnnounce, vLessons };
+			int errorCount = 0;
+			for (DateManagerValidation v : validations) {
+				errorCount += v.getErrors().size();
+			}
+
+			try {
+				if (errorCount == 0) {
+					updateAssignments(vAssignments);
+					updateAssessments(vAssessments);
+					updateGradebookItems(vGradebook);
+					updateSignupMeetings(vSignup);
+					updateResources(vResources);
+					updateCalendarEvents(vCalendar);
+					updateForums(vForums);
+					updateAnnouncements(vAnnounce);
+					updateLessons(vLessons);
+					int shifted = 0;
+					for (DateManagerValidation v : validations) {
+						shifted += v.getUpdates().size();
+					}
+					log.info("DateManager rollover: site {} shifted {} item(s) using mode {}", siteId, shifted, mode);
+				} else {
+					for (DateManagerValidation v : validations) {
+						for (DateManagerError e : v.getErrors()) {
+							log.warn("DateManager rollover: site {} validation error in {} [{}]: {}", siteId, e.toolId, e.field, e.msg);
+						}
+					}
+					log.warn("DateManager rollover: site {} NOT shifted; {} validation error(s) - dates left as copied", siteId, errorCount);
+				}
+			} finally {
+				// Always release edit locks acquired during validation.
+				clearLocksQuietly(vResources, vCalendar, vAnnounce);
+			}
+		} catch (Exception e) {
+			// A rollover shift must never break the caller (e.g. a site duplicate).
+			log.warn("DateManager rollover: unexpected error shifting dates for site {}: {}", siteId, e.toString(), e);
+		}
+	}
+
+	/** Global earliest/latest across every dated cell of every tool, or null if there are no dates. */
+	private ZonedDateTime[] computeDateExtent(JSONArray[] allTools, ZoneId zone) {
+		ZonedDateTime min = null;
+		ZonedDateTime max = null;
+		for (JSONArray arr : allTools) {
+			for (Object o : arr) {
+				JSONObject row = (JSONObject) o;
+				for (String key : SHIFTABLE_DATE_KEYS) {
+					ZonedDateTime z = parseUserZoneDate(row.get(key), zone);
+					if (z == null) {
+						continue;
+					}
+					if (min == null || z.isBefore(min)) {
+						min = z;
+					}
+					if (max == null || z.isAfter(max)) {
+						max = z;
+					}
+				}
+			}
+		}
+		return (min == null) ? null : new ZonedDateTime[] { min, max };
+	}
+
+	/** Inject the row index validate*() requires, and shift every populated date cell in place. */
+	private void shiftRows(JSONArray arr, ZoneId zone, UnaryOperator<ZonedDateTime> shift) {
+		for (int i = 0; i < arr.size(); i++) {
+			JSONObject row = (JSONObject) arr.get(i);
+			row.put(DateManagerConstants.JSON_IDX_PARAM_NAME, i);
+			for (String key : SHIFTABLE_DATE_KEYS) {
+				ZonedDateTime cur = parseUserZoneDate(row.get(key), zone);
+				if (cur == null) {
+					continue;
+				}
+				row.put(key, shift.apply(cur).format(outputDatePickerFormat));
+			}
+		}
+	}
+
+	/** Parse a get*ForContext date cell (user-zone wall clock, datetime or date-only) into the user zone. */
+	private ZonedDateTime parseUserZoneDate(Object raw, ZoneId zone) {
+		if (!(raw instanceof String) || StringUtils.isBlank((String) raw)) {
+			return null;
+		}
+		String s = ((String) raw).replaceAll("\"", "");
+		try {
+			return LocalDateTime.parse(s).atZone(zone);
+		} catch (DateTimeParseException e) {
+			try {
+				return LocalDate.parse(s).atStartOfDay(zone);
+			} catch (DateTimeParseException e2) {
+				return null;
+			}
+		}
+	}
+
+	private void clearLocksQuietly(DateManagerValidation resources, DateManagerValidation calendar, DateManagerValidation announcements) {
+		try { clearUpdateResourceLocks(resources); } catch (Exception e) { log.warn("DateManager rollover: clearing resource locks failed: {}", e.toString()); }
+		try { clearUpdateCalendarLocks(calendar); } catch (Exception e) { log.warn("DateManager rollover: clearing calendar locks failed: {}", e.toString()); }
+		try { clearUpdateAnnouncementLocks(announcements); } catch (Exception e) { log.warn("DateManager rollover: clearing announcement locks failed: {}", e.toString()); }
 	}
 
 	private JSONArray orderJSONArrayByTitle(JSONArray jsonArray) {
