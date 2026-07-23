@@ -394,7 +394,7 @@ public class GradeSummaryTablePanel extends BasePanel implements IAjaxIndicatorA
 							gradeScore.add(
 									new Label("grade", FormatHelper.convertEmptyGradeToDash(FormatHelper.formatGradeForDisplay(rawGrade))));
 							gradeScore.add(new Label("outOf",
-									new StringResourceModel("label.studentsummary.outof").setParameters(assignment.getPoints())));
+									new StringResourceModel("label.studentsummary.outof.points").setParameters(assignment.getPoints())));
 
 							final WebMarkupContainer sakaiRubricButton = new WebMarkupContainer("sakai-rubric-student-button");
 							sakaiRubricButton.add(AttributeModifier.append("display", "icon"));
